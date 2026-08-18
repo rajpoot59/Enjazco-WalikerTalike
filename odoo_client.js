@@ -29,21 +29,37 @@ async function resolveToken(token, { forceRefresh = false } = {}) {
     return cached.data;
   }
 
+  // Short, privacy-safe fingerprint for log lines below -- enough to tell
+  // "same token every time" from "a different token each attempt" without
+  // printing the whole secret into pm2 logs.
+  const fp = token.length > 8 ? `${token.slice(0, 4)}...${token.slice(-4)} (len ${token.length})` : `len ${token.length}`;
+
   let res;
   try {
     res = await fetch(`${ODOO_BASE_URL}/api/walkie/roster`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token })
+      // Odoo's type='json' controllers read the request body as JSON-RPC:
+      // they pull kwargs from a top-level "params" key specifically
+      // (odoo/http.py: self.params = jsonrequest.get('params', {})). A flat
+      // {"token": "..."} body has no "params" key, so Odoo sees an EMPTY
+      // params dict, the controller's kw.get('token') comes back None, and
+      // walkie_api.py correctly (if confusingly) reports "invalid token" --
+      // the token was never actually wrong, it just never arrived.
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'call', params: { token } })
     });
   } catch (err) {
+    console.error(`[odoo_client] fetch to ${ODOO_BASE_URL}/api/walkie/roster failed for token ${fp}:`, err.message);
     throw new Error(`Could not reach Odoo at ${ODOO_BASE_URL}: ${err.message}`);
   }
 
+  let rawText;
   let body;
   try {
-    body = await res.json();
+    rawText = await res.text();
+    body = JSON.parse(rawText);
   } catch (err) {
+    console.error(`[odoo_client] non-JSON response for token ${fp}: HTTP ${res.status}, body: ${(rawText || '').slice(0, 300)}`);
     throw new Error('Odoo returned a non-JSON response.');
   }
 
@@ -51,8 +67,11 @@ async function resolveToken(token, { forceRefresh = false } = {}) {
   const data = body && body.result ? body.result : body;
 
   if (!data || data.status !== 'ok') {
+    console.error(`[odoo_client] roster rejected token ${fp}: HTTP ${res.status}, message="${(data && data.message) || 'none'}", raw=${JSON.stringify(body).slice(0, 300)}`);
     throw new Error((data && data.message) || 'Odoo rejected this token.');
   }
+
+  console.log(`[odoo_client] resolved token ${fp} -> employee ${data.me?.employee_no || data.me?.employee_id}, hasTeam=${!!data.has_team}`);
 
   const result = {
     employeeId: data.me?.employee_id,
