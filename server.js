@@ -75,10 +75,12 @@ io.on('connection', socket => {
   let me = null; // { employeeNumber, name, channelId, roster }
 
   socket.on('auth', async ({ token } = {}) => {
+    console.log(`[auth] attempt from socket ${socket.id}, token present: ${!!token}`);
     let resolved;
     try {
       resolved = await odoo.resolveToken(token);
     } catch (err) {
+      console.error(`[auth] rejected for socket ${socket.id}: ${err.message}`);
       socket.emit('auth-error', { error: err.message });
       return;
     }
