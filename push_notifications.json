@@ -1,0 +1,86 @@
+// push_notifications.js — wakes up a phone via Firebase Cloud Messaging when
+// a call-invite target has no live socket connection (app backgrounded,
+// killed, or screen off). Verified against firebase-admin v14's real API
+// (modular imports, not the old admin.credential.cert() namespace, which no
+// longer exists in this version) by installing the package and inspecting
+// its actual type declarations -- not guessed.
+//
+// Safe to require even before the service account key exists on this box:
+// init() just logs a warning once and every send*() call below becomes a
+// no-op returning false, so the rest of the relay (sockets, PTT, in-app
+// calls) keeps working exactly as before.
+
+const fs = require('fs');
+
+const SERVICE_ACCOUNT_PATH =
+  process.env.FIREBASE_SERVICE_ACCOUNT_PATH || './firebase-service-account.json';
+
+let messaging = null;
+let initError = null;
+
+function init() {
+  if (messaging || initError) return;
+  try {
+    if (!fs.existsSync(SERVICE_ACCOUNT_PATH)) {
+      initError = `not found at ${SERVICE_ACCOUNT_PATH} (set FIREBASE_SERVICE_ACCOUNT_PATH to override)`;
+      console.warn(`[push] Firebase service account ${initError} -- background call pushes disabled`);
+      return;
+    }
+    const { initializeApp, cert } = require('firebase-admin/app');
+    const { getMessaging } = require('firebase-admin/messaging');
+    initializeApp({ credential: cert(SERVICE_ACCOUNT_PATH) });
+    messaging = getMessaging();
+    console.log('[push] Firebase Admin initialized -- background call pushes enabled');
+  } catch (err) {
+    initError = err.message;
+    console.error(`[push] Firebase Admin init failed: ${err.message}`);
+  }
+}
+init();
+
+// Data-only, high-priority "someone is calling you" push. Deliberately NO
+// `notification` field -- a notification payload would get auto-displayed by
+// Android's system tray (a plain, non-full-screen notice) instead of
+// reaching the app's own background handler, which is what builds the real
+// full-screen incoming-call UI. iceServers is JSON-stringified since FCM
+// data payloads must be flat string->string maps.
+async function sendIncomingCallPush(token, { callId, fromEmployeeNumber, fromName, iceServers }) {
+  if (!messaging || !token) return false;
+  try {
+    await messaging.send({
+      token,
+      android: { priority: 'high', ttl: 30_000 },
+      data: {
+        type: 'incoming_call',
+        callId: String(callId),
+        fromEmployeeNumber: String(fromEmployeeNumber),
+        fromName: String(fromName || ''),
+        iceServers: JSON.stringify(iceServers || [])
+      }
+    });
+    return true;
+  } catch (err) {
+    console.error(`[push] incoming-call send failed: ${err.message}`);
+    return false;
+  }
+}
+
+// Tells a woken-up device to dismiss its full-screen ringing UI -- e.g. the
+// caller hung up, or another of the callee's devices already answered,
+// before this device's socket ever reconnected.
+async function sendCallCancelPush(token, { callId }) {
+  if (!messaging || !token) return false;
+  try {
+    await messaging.send({
+      token,
+      android: { priority: 'high', ttl: 10_000 },
+      data: { type: 'call_cancelled', callId: String(callId) }
+    });
+    return true;
+  } catch (err) {
+    console.error(`[push] cancel send failed: ${err.message}`);
+    return false;
+  }
+}
+
+module.exports = { sendIncomingCallPush, sendCallCancelPush };

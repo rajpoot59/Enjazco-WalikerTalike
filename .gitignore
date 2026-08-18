@@ -2,3 +2,8 @@ node_modules/
 data.json
 server.log
 npm-debug.log*
+
+# Firebase Admin SDK service account key -- lets its holder send push
+# notifications as our Firebase project. Lives ONLY on the EC2 box (copied
+# there directly, never committed). See DEPLOY.md.
+firebase-service-account.json

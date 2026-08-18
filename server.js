@@ -25,6 +25,7 @@ const { Server } = require('socket.io');
 
 const odoo = require('./odoo_client');
 const turnCredentials = require('./turn_credentials');
+const push = require('./push_notifications');
 
 const PORT = process.env.PORT || 3000;
 const CALL_RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS || 30_000);
@@ -57,6 +58,11 @@ const socketsByEmployee = new Map();
 // employeeNumber -> name (only present while at least one socket is online)
 // -- used purely for the /api/online directory listing above.
 const employeeNames = new Map();
+// employeeNumber -> latest FCM registration token, so we can still ring a
+// phone via push when it has NO live socket (app killed / screen off).
+// Deliberately never cleared on disconnect -- that's exactly the case this
+// map exists to cover. Only overwritten when a fresher token registers.
+const fcmTokensByEmployee = new Map();
 // callId -> { callerSocketId, callerEmployeeNumber, callerName,
 //             targetEmployeeNumber, targetSocketId, ringSocketIds, status, timeout }
 const activeCalls = new Map();
@@ -88,6 +94,12 @@ function endCall(callId, { notify = true } = {}) {
   const targets = call.targetSocketId ? [call.targetSocketId] : (call.ringSocketIds || []);
   targets.forEach(sid => io.to(sid).emit('call-ended', { callId }));
   io.to(call.callerSocketId).emit('call-ended', { callId });
+  // If this call was only reachable via a background push (no live socket
+  // when invited) and never got accepted, tell that device to drop its
+  // full-screen ringing UI -- otherwise it rings until its own timeout.
+  if (call.pushedToken && call.status !== 'active') {
+    push.sendCallCancelPush(call.pushedToken, { callId });
+  }
 }
 
 // The "other side" of a call, relative to whichever socket sent a signaling
@@ -146,6 +158,14 @@ io.on('connection', socket => {
     broadcastRoster(me.channelId, me.roster);
   });
 
+  // Sent once the app has a live FCM token (right after Firebase init, and
+  // again whenever the token rotates) so this employee can still be reached
+  // by a call-invite even while fully offline from the relay's socket.
+  socket.on('register-fcm-token', ({ token } = {}) => {
+    if (!me || !token) return;
+    fcmTokensByEmployee.set(me.employeeNumber, token);
+  });
+
   // `target` is an optional employee number: when present this is a direct
   // 1:1 intercom call to that person, like paging a single extension; when
   // absent it's a broadcast to the whole team channel. Unchanged by the
@@ -186,13 +206,20 @@ io.on('connection', socket => {
 
   socket.on('call-invite', ({ target } = {}) => {
     if (!me || !target) return;
-    const targetSet = socketsByEmployee.get(String(target));
-    if (!targetSet || targetSet.size === 0) {
+    const targetKey = String(target);
+    const targetSet = socketsByEmployee.get(targetKey);
+    const ringSocketIds = targetSet ? Array.from(targetSet) : [];
+    // No live socket (app backgrounded/killed/screen off)? Fall back to
+    // waking it via FCM instead of failing outright, as long as it has
+    // registered a push token at some point.
+    const fcmToken = ringSocketIds.length === 0 ? fcmTokensByEmployee.get(targetKey) : null;
+
+    if (ringSocketIds.length === 0 && !fcmToken) {
       socket.emit('call-error', { error: `Employee #${target} is not online right now.` });
       return;
     }
+
     const callId = `call_${callSeq++}_${Date.now()}`;
-    const ringSocketIds = Array.from(targetSet);
     const iceServers = turnCredentials.buildIceServers(callId);
 
     const timeout = setTimeout(() => {
@@ -201,6 +228,7 @@ io.on('connection', socket => {
         activeCalls.delete(callId);
         io.to(call.callerSocketId).emit('call-timeout', { callId });
         (call.ringSocketIds || []).forEach(sid => io.to(sid).emit('call-cancelled', { callId }));
+        if (call.pushedToken) push.sendCallCancelPush(call.pushedToken, { callId });
       }
     }, CALL_RING_TIMEOUT_MS);
 
@@ -209,9 +237,10 @@ io.on('connection', socket => {
       callerSocketId: socket.id,
       callerEmployeeNumber: me.employeeNumber,
       callerName: me.name,
-      targetEmployeeNumber: String(target),
+      targetEmployeeNumber: targetKey,
       targetSocketId: null,
       ringSocketIds,
+      pushedToken: fcmToken,
       status: 'ringing',
       timeout
     });
@@ -221,9 +250,30 @@ io.on('connection', socket => {
     // server list its WebRTC connection will need once accepted.
     socket.emit('call-ringing', { callId, iceServers });
 
-    ringSocketIds.forEach(sid => io.to(sid).emit('incoming-call', {
+    if (ringSocketIds.length > 0) {
+      ringSocketIds.forEach(sid => io.to(sid).emit('incoming-call', {
+        callId, fromEmployeeNumber: me.employeeNumber, fromName: me.name, iceServers
+      }));
+      return;
+    }
+
+    // Push-only path: the callee's app has to reconnect+auth+call-accept on
+    // its own once the notification is tapped/answered, same as it would
+    // from the normal in-app ring -- this relay doesn't do anything special
+    // for it beyond getting the notification there.
+    push.sendIncomingCallPush(fcmToken, {
       callId, fromEmployeeNumber: me.employeeNumber, fromName: me.name, iceServers
-    }));
+    }).then(sent => {
+      if (sent) return;
+      const call = activeCalls.get(callId);
+      if (call && call.status === 'ringing') {
+        clearTimeout(call.timeout);
+        activeCalls.delete(callId);
+        io.to(call.callerSocketId).emit('call-error', {
+          error: `Employee #${target} could not be reached (push notification failed).`
+        });
+      }
+    });
   });
 
   socket.on('call-accept', ({ callId } = {}) => {
