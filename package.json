@@ -1,0 +1,13 @@
+{
+  "name": "enjaz-walkie-talkie",
+  "version": "1.0.0",
+  "description": "Push-to-talk walkie-talkie relay for EnjazCo, backed by Odoo (employees/teams) via walkie_api.py",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
+  }
+}
