@@ -8,6 +8,11 @@
 // is on, and groups sockets into rooms accordingly. Teams and employees are
 // still managed however you already manage them in Odoo
 // (x_team_analytic_account, hr.employee) — nothing new to maintain here.
+//
+// Also handles "calls": a ring/accept flow for private 1:1 sessions on top
+// of the same hold-to-talk mechanism (see the call-* events below). This is
+// NOT live duplex audio (that would need WebRTC + a TURN server) — it's
+// push-to-talk between exactly two people, after one of them "answers".
 
 const path = require('path');
 const express = require('express');
@@ -17,6 +22,7 @@ const { Server } = require('socket.io');
 const odoo = require('./odoo_client');
 
 const PORT = process.env.PORT || 3000;
+const CALL_RING_TIMEOUT_MS = Number(process.env.CALL_RING_TIMEOUT_MS || 30_000);
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -32,6 +38,10 @@ const io = new Server(server, { maxHttpBufferSize: 5e6 }); // allow ~5MB audio b
 const onlineByChannel = new Map();
 // employeeNumber -> Set(socketId)  (global, for direct/intercom calls)
 const socketsByEmployee = new Map();
+// callId -> { callerSocketId, callerEmployeeNumber, callerName,
+//             targetEmployeeNumber, targetSocketId, ringSocketIds, status, timeout }
+const activeCalls = new Map();
+let callSeq = 1;
 
 function broadcastRoster(channelId, fullRoster) {
   const online = onlineByChannel.get(channelId) || new Map();
@@ -48,6 +58,17 @@ function emitToEmployee(employeeNumber, event, payload) {
   if (!set || set.size === 0) return false;
   set.forEach(socketId => io.to(socketId).emit(event, payload));
   return true;
+}
+
+function endCall(callId, { notify = true } = {}) {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  clearTimeout(call.timeout);
+  activeCalls.delete(callId);
+  if (!notify) return;
+  const targets = call.targetSocketId ? [call.targetSocketId] : (call.ringSocketIds || []);
+  targets.forEach(sid => io.to(sid).emit('call-ended', { callId }));
+  io.to(call.callerSocketId).emit('call-ended', { callId });
 }
 
 io.on('connection', socket => {
@@ -129,7 +150,95 @@ io.on('connection', socket => {
     }
   });
 
+  // --- calls: ring -> accept/decline -> (if accepted) private ptt session ---
+
+  socket.on('call-invite', ({ target } = {}) => {
+    if (!me || !target) return;
+    const targetSet = socketsByEmployee.get(String(target));
+    if (!targetSet || targetSet.size === 0) {
+      socket.emit('call-error', { error: `Employee #${target} is not online right now.` });
+      return;
+    }
+    const callId = `call_${callSeq++}_${Date.now()}`;
+    const ringSocketIds = Array.from(targetSet);
+    const timeout = setTimeout(() => {
+      const call = activeCalls.get(callId);
+      if (call && call.status === 'ringing') {
+        activeCalls.delete(callId);
+        io.to(call.callerSocketId).emit('call-timeout', { callId });
+        (call.ringSocketIds || []).forEach(sid => io.to(sid).emit('call-cancelled', { callId }));
+      }
+    }, CALL_RING_TIMEOUT_MS);
+
+    activeCalls.set(callId, {
+      callId,
+      callerSocketId: socket.id,
+      callerEmployeeNumber: me.employeeNumber,
+      callerName: me.name,
+      targetEmployeeNumber: String(target),
+      targetSocketId: null,
+      ringSocketIds,
+      status: 'ringing',
+      timeout
+    });
+
+    // Ack back to the caller with the callId, so their "ringing" screen can
+    // send an explicit call-end (cancel) before anyone answers, instead of
+    // only being able to wait out the ring timeout.
+    socket.emit('call-ringing', { callId });
+
+    ringSocketIds.forEach(sid => io.to(sid).emit('incoming-call', {
+      callId, fromEmployeeNumber: me.employeeNumber, fromName: me.name
+    }));
+  });
+
+  socket.on('call-accept', ({ callId } = {}) => {
+    const call = activeCalls.get(callId);
+    if (!call || call.status !== 'ringing') return;
+    clearTimeout(call.timeout);
+    call.status = 'active';
+    call.targetSocketId = socket.id;
+
+    const accepterNumber = me ? me.employeeNumber : call.targetEmployeeNumber;
+    const accepterName = me ? me.name : '';
+
+    io.to(call.callerSocketId).emit('call-accepted', {
+      callId, employeeNumber: accepterNumber, name: accepterName
+    });
+    socket.emit('call-accepted', {
+      callId, employeeNumber: call.callerEmployeeNumber, name: call.callerName
+    });
+
+    // tell any *other* devices that were ringing for the same employee to
+    // stop ringing, since one of them just answered
+    (call.ringSocketIds || []).forEach(sid => {
+      if (sid !== socket.id) io.to(sid).emit('call-cancelled', { callId });
+    });
+  });
+
+  socket.on('call-decline', ({ callId } = {}) => {
+    const call = activeCalls.get(callId);
+    if (!call) return;
+    clearTimeout(call.timeout);
+    activeCalls.delete(callId);
+    io.to(call.callerSocketId).emit('call-declined', { callId });
+    (call.ringSocketIds || []).forEach(sid => {
+      if (sid !== socket.id) io.to(sid).emit('call-cancelled', { callId });
+    });
+  });
+
+  socket.on('call-end', ({ callId } = {}) => {
+    endCall(callId);
+  });
+
   socket.on('disconnect', () => {
+    // clean up any calls this socket was the caller or the (accepted) callee for
+    for (const [callId, call] of activeCalls.entries()) {
+      if (call.callerSocketId === socket.id || call.targetSocketId === socket.id) {
+        endCall(callId);
+      }
+    }
+
     if (!me) return;
     const online = onlineByChannel.get(me.channelId);
     if (online) {
